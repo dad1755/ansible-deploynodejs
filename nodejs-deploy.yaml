@@ -1,0 +1,124 @@
+---
+- name: Deploy Node.js application on Amazon Linux 2023 EC2
+  hosts: app
+  become: yes
+  vars:
+    node_version: "20.17.0"
+    app_dir: "/home/ec2-user/app"
+    app_port: 3000
+
+  tasks:
+    - name: Update system packages
+      dnf:
+        name: "*"
+        state: latest
+      register: update_result
+      retries: 3
+      delay: 5
+      until: update_result is success
+
+    - name: Remove curl-minimal to avoid conflicts
+      dnf:
+        name: curl-minimal
+        state: absent
+
+    - name: Install curl and git
+      dnf:
+        name:
+          - curl
+          - git
+        state: present
+
+    - name: Install nvm
+      ansible.builtin.shell: |
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+      args:
+        creates: "/home/ec2-user/.nvm/nvm.sh"
+      become_user: ec2-user
+
+    - name: Source nvm in .bashrc
+      ansible.builtin.lineinfile:
+        path: /home/ec2-user/.bashrc
+        line: '[ -s "$HOME/.nvm/nvm.sh" ] && \. "$HOME/.nvm/nvm.sh"'
+        create: yes
+      become_user: ec2-user
+
+    - name: Install Node.js
+      ansible.builtin.shell: |
+        . /home/ec2-user/.nvm/nvm.sh && nvm install {{ node_version }}
+      args:
+        creates: "/home/ec2-user/.nvm/versions/node/v{{ node_version }}"
+      become_user: ec2-user
+
+    - name: Install PM2 globally
+      ansible.builtin.shell: |
+        . /home/ec2-user/.nvm/nvm.sh && npm install -g pm2
+      args:
+        creates: "/home/ec2-user/.nvm/versions/node/v{{ node_version }}/bin/pm2"
+      become_user: ec2-user
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ec2-user
+        group: ec2-user
+        mode: '0755'
+
+    - name: Deploy sample Node.js application
+      copy:
+        content: |
+          const http = require('http');
+          const PORT = {{ app_port }};
+          const server = http.createServer((req, res) => {
+            res.statusCode = 200;
+            res.setHeader('Content-Type', 'text/plain');
+            res.end('Hello from Node.js!\n');
+          });
+          server.listen(PORT, () => {
+            console.log(`Server running on port ${PORT}`);
+          });
+        dest: "{{ app_dir }}/server.js"
+        owner: ec2-user
+        group: ec2-user
+        mode: '0644'
+
+    - name: Install NGINX
+      dnf:
+        name: nginx
+        state: present
+
+    - name: Configure NGINX
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://localhost:{{ app_port }};
+                  proxy_set_header Host $host;
+              }
+          }
+        dest: /etc/nginx/conf.d/nodejs.conf
+        mode: '0644'
+      notify: Restart NGINX
+
+    - name: Start and enable NGINX
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Start Node.js application with PM2
+      ansible.builtin.shell: |
+        . /home/ec2-user/.nvm/nvm.sh && pm2 start {{ app_dir }}/server.js
+      args:
+        chdir: "{{ app_dir }}"
+        creates: "/home/ec2-user/.pm2/logs"
+      become_user: ec2-user
+
+  handlers:
+    - name: Restart NGINX
+      systemd:
+        name: nginx
+        state: restarted
